@@ -6,6 +6,7 @@
 #include <SPI.h>
 
 #include <SparkFun_u-blox_GNSS_v3.h>
+#include <TCA9548.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_MS8607.h>
 #include <Adafruit_Sensor.h>
@@ -38,9 +39,8 @@
 TwoWire i2c(PB7, PB6);
 SFE_UBLOX_GNSS m10s;
 Adafruit_BME280 bme;
-
-// multiplexer
-Adafruit_MS8607 ms1;
+Adafruit_MS8607 ms8607[2];
+TCA9548 tca(0x70, &i2c);
 
 // SPI
 SPIClass spi1(PIN_SPI_MOSI1, PIN_SPI_MISO1, PIN_SPI_SCK1);
@@ -85,19 +85,28 @@ struct Data
   float humid;
   float press;
 
-  // 96 bits
-  float temp_ms1;
-  float humid_ms1;
-  float press_ms1;
+  struct MS8607Data
+  {
+    float pres{};
+    float alt{};
+    float temp{};
+    float humid{};
+  } msData[2]{};
 };
+
+// Status
+struct Status
+{
+  bool tca9548;
+  bool m10s;
+  bool ms8607[2];
+} status{};
 
 Data data;
 SemaphoreHandle_t i2cMutex;
 
 // Communication data
 String constructed_data;
-
-bool validm10s;
 
 extern void read_m10s(void *);
 
@@ -130,16 +139,19 @@ void setup()
   // variable
   static bool state;
 
-  // // SD
+  // SD
   state = sd.begin(sd_config);
   Serial.printf("SD CARD: %s\n", state ? "SUCCESS" : "FAILED");
   if (!state)
     while (true)
       ;
-  if (!file.open("data.csv", O_RDWR | O_CREAT | O_AT_END))
+  if (file = sd.open("data.csv", O_RDWR | O_CREAT | O_AT_END | O_APPEND))
+  {
+    Serial.println("File open Success!");
+  }
+  else
   {
     Serial.println("File open failed!");
-    return;
   }
 
   // LoRa
@@ -150,6 +162,9 @@ void setup()
                           params.sync_word,
                           params.power,
                           params.preamble_length);
+  state = state || lora.explicitHeader();
+  state = state || lora.setCRC(true);
+  state = state || lora.autoLDRO();
 
   if (ls == RADIOLIB_ERR_NONE)
   {
@@ -166,8 +181,8 @@ void setup()
   s.reserve(256);
 
   // m10s (0x42)
-  validm10s = m10s.begin(i2c);
-  if (validm10s)
+  status.m10s = m10s.begin(i2c);
+  if (status.m10s)
   {
     m10s.setI2COutput(COM_TYPE_UBX, VAL_LAYER_RAM_BBR, UBLOX_CUSTOM_MAX_WAIT);
     m10s.setNavigationFrequency(25, VAL_LAYER_RAM_BBR, UBLOX_CUSTOM_MAX_WAIT);
@@ -175,16 +190,28 @@ void setup()
     m10s.setDynamicModel(DYN_MODEL_AIRBORNE4g, VAL_LAYER_RAM_BBR, UBLOX_CUSTOM_MAX_WAIT);
   }
 
-  // bme280(0x77)
+  // bme280 (0x77)
   if (!bme.begin(0x77, &i2c))
   {
     Serial.println("Could not find a valid BME280 sensor");
   }
 
-  // ms8607
-  if (!ms1.begin(&i2c))
+  // ms8607 (0x76, 0x40)
+  status.tca9548 = tca.begin(0b00000000);
+  Serial.printf("TCA9548 %s\n", status.tca9548 ? "SUCCESS" : "FAILED");
+  for (size_t i = 0; i < 2; ++i)
   {
-    Serial.println("MS Unsuccess");
+    tca.enableChannel(i);
+    tca.selectChannel(i);
+    if (tca.isConnected(0x76) && tca.isConnected(0x40))
+    {
+      status.ms8607[i] = ms8607[i].begin(&i2c);
+      ms8607[i].setHumidityResolution(MS8607_HUMIDITY_RESOLUTION_OSR_10b);
+      ms8607[i].setPressureResolution(MS8607_PRESSURE_RESOLUTION_OSR_4096);
+      Serial.printf("MS8607 EXT %d %s\n", i, status.ms8607[i] ? "SUCCESS" : "FAILED");
+    }
+    else
+      Serial.printf("MS8607 EXT %d NO DEVICE FOUND\n", i);
   }
 
   xTaskCreate(read_m10s, "", 2048, nullptr, 2, nullptr);
@@ -237,20 +264,18 @@ void read_ms(void *)
   {
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE)
     {
-      sensors_event_t temp, pressure, humidity;
-
-      // Read ms1
-      Adafruit_Sensor *pressure_sensor = ms1.getPressureSensor();
-      Adafruit_Sensor *temp_sensor = ms1.getTemperatureSensor();
-      Adafruit_Sensor *humidity_sensor = ms1.getHumiditySensor();
-
-      temp_sensor->getEvent(&temp);
-      pressure_sensor->getEvent(&pressure);
-      humidity_sensor->getEvent(&humidity);
-      
-      data.temp_ms1 = temp.temperature;
-      data.humid_ms1 = humidity.relative_humidity;
-      data.press_ms1 = pressure.pressure;
+      for (size_t i = 0; i = 2; ++i)
+      {
+        if (status.ms8607[i])
+          tca.selectChannel(i);
+          sensors_event_t temp, pressure, humidity;
+          
+          ms8607[i].getEvent(&pressure, &temp, &humidity);
+          data.msData[i].pres = pressure.pressure;
+          data.msData[i].alt = pressure.altitude;
+          data.msData[i].temp = temp.temperature;
+          data.msData[i].humid = humidity.relative_humidity;
+      }
       xSemaphoreGive(i2cMutex);
     }
     DELAY(200);
@@ -272,9 +297,14 @@ void construct_data(void *)
         << data.temp
         << data.humid
         << data.press
-        << data.temp_ms1
-        << data.humid_ms1
-        << data.press_ms1;
+        << data.msData[0].pres
+        << data.msData[0].alt
+        << data.msData[0].temp
+        << data.msData[0].humid
+        << data.msData[1].pres
+        << data.msData[1].alt
+        << data.msData[1].temp
+        << data.msData[1].humid;
     DELAY(1000);
   }
 }
@@ -347,13 +377,6 @@ void print_data(void *)
     Serial.println(data.humid);
     Serial.print("Press: ");
     Serial.println(data.press);
-
-    Serial.print("Temp MS1: ");
-    Serial.println(data.temp_ms1);
-    Serial.print("Humid MS1: ");
-    Serial.println(data.humid_ms1);
-    Serial.print("Press MS1: ");
-    Serial.println(data.press_ms1);
 
     Serial.println("----------------");
 
