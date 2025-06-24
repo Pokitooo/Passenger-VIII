@@ -267,14 +267,16 @@ void read_ms(void *)
       for (size_t i = 0; i = 2; ++i)
       {
         if (status.ms8607[i])
+        {
           tca.selectChannel(i);
           sensors_event_t temp, pressure, humidity;
-          
+
           ms8607[i].getEvent(&pressure, &temp, &humidity);
           data.msData[i].pres = pressure.pressure;
           data.msData[i].alt = pressure.altitude;
           data.msData[i].temp = temp.temperature;
           data.msData[i].humid = humidity.relative_humidity;
+        }
       }
       xSemaphoreGive(i2cMutex);
     }
